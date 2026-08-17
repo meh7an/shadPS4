@@ -88,6 +88,9 @@ public:
     /// Invalidates any image in the logical page range.
     void InvalidateMemory(VAddr addr, size_t size);
 
+    /// Handles a CPU read fault on a read-watched GPU-modified image by downloading it.
+    bool ReadMemory(VAddr addr, size_t size);
+
     /// Marks an image as dirty if it exists at the provided address.
     void InvalidateMemoryFromGPU(VAddr address, size_t max_size);
 
@@ -284,7 +287,7 @@ private:
 
     [[nodiscard]] PendingImageDownload ScheduleImageDownload(Image& image, Buffer& buffer, u8* data,
                                                              u64 buffer_offset);
-    void DownloadImageMemory(ImageId image_id);
+    void DownloadImageMemory(ImageId image_id, bool sync = false);
 
     /// Create an image from the given parameters
     [[nodiscard]] ImageId InsertImage(const ImageInfo& info, VAddr cpu_addr);
@@ -304,6 +307,12 @@ private:
     void UntrackImage(ImageId image_id);
     void UntrackImageHead(ImageId image_id);
     void UntrackImageTail(ImageId image_id);
+
+    /// Read-protect a GPU-written CPU-readable image so guest reads fault and download it
+    [[nodiscard]] bool IsCpuReadbackCandidate(const Image& image) const;
+    void ArmCpuReadWatch(ImageId image_id);
+    void DisarmCpuReadWatch(ImageId image_id);
+    void UpdateReadWatchPages(VAddr start, VAddr end, bool track);
 
     void MarkAsMaybeDirty(ImageId image_id, Image& image);
 
@@ -385,7 +394,10 @@ private:
     Common::LeastRecentlyUsedCache<u64, u64> sampler_lru_cache;
     bool readback_linear_images;
     PageTable page_table;
-    std::mutex mutex;
+    // Recursive: a CPU read-watch fault can be taken by emulator code that reads guest
+    // memory while already holding the cache lock (image hashing, uploads); the fault
+    // handler then re-enters the cache on the same thread to service the download.
+    std::recursive_mutex mutex;
     std::mutex samplers_mutex;
     struct MetaDataInfo {
         MetaType type;

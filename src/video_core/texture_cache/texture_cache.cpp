@@ -16,6 +16,7 @@
 #include "common/scope_exit.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
+#include "video_core/amdgpu/liverpool.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/buffer_cache/region_definitions.h"
 #include "video_core/page_manager.h"
@@ -30,6 +31,10 @@ namespace VideoCore {
 
 static constexpr u64 PageShift = 12;
 static constexpr u64 NumFramesBeforeRemoval = 32;
+// GPU-written images at or below this size are downloaded to guest memory eagerly at fence
+// signals instead of being read-watched: they cannot own their pages, so read protection
+// would make unrelated data sharing the page fault on every access.
+static constexpr u64 CpuReadbackEagerSize = 4_KB;
 
 struct PendingImageDownload {
     struct Page {
@@ -260,6 +265,18 @@ void TextureCache::PrepareImageAccess(ImageId image_id, AliasAccess access, bool
     SynchronizeAlias(image_id);
     if (access == AliasAccess::ReadWrite) {
         PublishAliasWrite(image_id);
+        Image& image = slot_images[image_id];
+        if (IsCpuReadbackCandidate(image)) {
+            if (image.info.guest_size <= CpuReadbackEagerSize) {
+                // Sub-page surfaces cannot own their pages; read-watching them makes
+                // unrelated data sharing the page fault on every access. Download them
+                // eagerly at the next fence instead, which is what the game observes on
+                // hardware and costs next to nothing at these sizes.
+                queue_download = true;
+            } else {
+                ArmCpuReadWatch(image_id);
+            }
+        }
     }
     if (queue_download) {
         download_images.emplace(image_id);
@@ -543,7 +560,7 @@ PendingImageDownload TextureCache::ScheduleImageDownload(Image& image, Buffer& b
     };
 }
 
-void TextureCache::DownloadImageMemory(ImageId image_id) {
+void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
     Image& image = slot_images[image_id];
     if (False(image.flags & ImageFlagBits::GpuModified)) {
         return;
@@ -553,11 +570,93 @@ void TextureCache::DownloadImageMemory(ImageId image_id) {
                                            download_size);
     PendingImageDownload pending =
         ScheduleImageDownload(image, *buffer, buffer->mapped_data.data(), 0);
+    if (sync) {
+        scheduler.Finish();
+        readback_tracker->CompleteSync(pending);
+        return;
+    }
     pending.async_buffer = std::move(buffer);
     readback_tracker->TrackAsync(pending);
     scheduler.DeferPriorityOperation([tracker = readback_tracker, pending = std::move(pending)] {
         tracker->CompleteAsync(pending);
     });
+}
+
+bool TextureCache::IsCpuReadbackCandidate(const Image& image) const {
+    return (!image.info.props.is_tiled || image.info.size.width <= 8) &&
+           !image.info.props.is_depth && image.info.guest_address != 0;
+}
+
+void TextureCache::UpdateReadWatchPages(VAddr start, VAddr end, bool track) {
+    // The watcher API operates on one tracker region at a time.
+    VAddr addr = start;
+    while (addr < end) {
+        const VAddr region_base = addr & ~TRACKER_HIGHER_PAGE_MASK;
+        const VAddr region_end = std::min<VAddr>(end, region_base + TRACKER_HIGHER_PAGE_SIZE);
+        const size_t first_page = (addr - region_base) >> TRACKER_PAGE_BITS;
+        const size_t end_page = Common::DivCeil(region_end - region_base, TRACKER_BYTES_PER_PAGE);
+        RegionBits mask;
+        mask.Clear();
+        mask.SetRange(first_page, end_page);
+        // Pair the read watch with a write watch: read-blocked but writable pages are
+        // not representable by the host protection API, and a CPU write to a GPU-written
+        // image must fault into invalidation anyway.
+        if (track) {
+            tracker.UpdatePageWatchersForRegion<true, true>(region_base, mask);
+            tracker.UpdatePageWatchersForRegion<true, false>(region_base, mask);
+        } else {
+            tracker.UpdatePageWatchersForRegion<false, true>(region_base, mask);
+            tracker.UpdatePageWatchersForRegion<false, false>(region_base, mask);
+        }
+        addr = region_end;
+    }
+}
+
+void TextureCache::ArmCpuReadWatch(ImageId image_id) {
+    Image& image = slot_images[image_id];
+    if (image.cpu_read_watch != 0 || False(image.flags & ImageFlagBits::Registered)) {
+        return;
+    }
+    const VAddr start = PageManager::GetPageAddr(image.info.guest_address);
+    const VAddr end =
+        PageManager::GetNextPageAddr(image.info.guest_address + image.info.guest_size - 1);
+    image.cpu_read_watch = start;
+    image.cpu_read_watch_end = end;
+    UpdateReadWatchPages(start, end, true);
+}
+
+void TextureCache::DisarmCpuReadWatch(ImageId image_id) {
+    Image& image = slot_images[image_id];
+    if (image.cpu_read_watch == 0) {
+        return;
+    }
+    const VAddr start = image.cpu_read_watch;
+    const VAddr end = image.cpu_read_watch_end;
+    image.cpu_read_watch = 0;
+    image.cpu_read_watch_end = 0;
+    UpdateReadWatchPages(start, end, false);
+}
+
+bool TextureCache::ReadMemory(VAddr addr, size_t size) {
+    bool handled = false;
+    liverpool->SendCommand<true>([&] {
+        std::scoped_lock lock{mutex};
+        const VAddr pages_start = PageManager::GetPageAddr(addr);
+        const VAddr pages_end = PageManager::GetNextPageAddr(addr + size - 1);
+        ForEachImageInRegion(
+            pages_start, pages_end - pages_start, [&](ImageId image_id, Image& image) {
+                if (image.cpu_read_watch == 0 || image.cpu_read_watch >= pages_end ||
+                    pages_start >= image.cpu_read_watch_end) {
+                    return;
+                }
+                handled = true;
+                // Lift the protection before the download so the fault cannot recur even if
+                // the image has nothing to write back.
+                DisarmCpuReadWatch(image_id);
+                DownloadImageMemory(image_id, true);
+            });
+    });
+    return handled;
 }
 
 void TextureCache::MarkAsMaybeDirty(ImageId image_id, Image& image) {
@@ -590,6 +689,13 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
     ForEachImageInRegion(pages_start, pages_end - pages_start, [&](ImageId image_id, Image& image) {
         const auto image_begin = image.info.guest_address;
         const auto image_end = image.info.guest_address + image.info.guest_size;
+        if (image.cpu_read_watch != 0 && image.cpu_read_watch < pages_end &&
+            pages_start < image.cpu_read_watch_end) {
+            // The write touches the armed page span even if it misses the image bytes;
+            // contiguous images share boundary pages, and a watch left armed here would
+            // keep the page protected and re-fault the write forever.
+            DisarmCpuReadWatch(image_id);
+        }
         if (image.Overlaps(addr, size)) {
             // Modified region overlaps image, so the image was definitely accessed by this fault.
             // Untrack the image, so that the range is unprotected and the guest can write freely.
@@ -1180,6 +1286,14 @@ void TextureCache::RefreshImage(Image& image) {
         return;
     }
 
+    if (image.cpu_read_watch != 0) {
+        // While the read watch is armed no CPU write can have happened (it would have
+        // faulted and disarmed), and reading guest memory here would fault a download
+        // of intentionally stale data. Nothing to refresh.
+        image.flags &= ~ImageFlagBits::MaybeCpuDirty;
+        return;
+    }
+
     RENDERER_TRACE;
     TRACE_HINT(fmt::format("{:x}:{:x}", image.info.guest_address, image.info.guest_size));
 
@@ -1322,6 +1436,7 @@ void TextureCache::UnregisterImage(ImageId image_id) {
     Image& image = slot_images[image_id];
     ASSERT_MSG(True(image.flags & ImageFlagBits::Registered),
                "Trying to unregister an already unregistered image");
+    DisarmCpuReadWatch(image_id);
     image.flags &= ~ImageFlagBits::Registered;
     lru_cache.Free(image.lru_id);
     total_used_memory -= Common::AlignUp(image.info.guest_size, 1024);

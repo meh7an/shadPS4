@@ -154,6 +154,8 @@ public:
     ImageFlagBits flags = ImageFlagBits::Dirty;
     VAddr track_addr = 0;
     VAddr track_addr_end = 0;
+    VAddr cpu_read_watch = 0;
+    VAddr cpu_read_watch_end = 0;
     ImageId depth_id{};
     u64 depth_uid{};
 
