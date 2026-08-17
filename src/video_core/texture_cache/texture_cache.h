@@ -87,6 +87,9 @@ public:
     /// Invalidates any image in the logical page range.
     void InvalidateMemory(VAddr addr, size_t size);
 
+    /// Handles a CPU read fault on a read-watched GPU-modified image by downloading it.
+    bool ReadMemory(VAddr addr, size_t size);
+
     /// Marks an image as dirty if it exists at the provided address.
     void InvalidateMemoryFromGPU(VAddr address, size_t max_size);
 
@@ -292,6 +295,12 @@ private:
     void UntrackImage(ImageId image_id);
     void UntrackImageHead(ImageId image_id);
     void UntrackImageTail(ImageId image_id);
+
+    /// Read-protect a GPU-written CPU-readable image so guest reads fault and download it
+    [[nodiscard]] bool IsCpuReadbackCandidate(const Image& image) const;
+    void ArmCpuReadWatch(ImageId image_id);
+    void DisarmCpuReadWatch(ImageId image_id);
+    void UpdateReadWatchPages(VAddr start, VAddr end, bool track);
 
     void MarkAsMaybeDirty(ImageId image_id, Image& image);
 

@@ -1082,6 +1082,11 @@ bool Rasterizer::ReadMemory(VAddr addr, u64 size) {
         // Not GPU mapped memory, can skip invalidation logic entirely.
         return false;
     }
+    if (texture_cache.ReadMemory(addr, size)) {
+        // An image owned the watched page; do not enter the buffer path from the fault
+        // handler, as the faulting thread may already hold buffer cache locks.
+        return true;
+    }
     buffer_cache.ReadMemory(addr, size);
     return true;
 }
