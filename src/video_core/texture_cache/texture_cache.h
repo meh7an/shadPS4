@@ -302,6 +302,10 @@ private:
     void DisarmCpuReadWatch(ImageId image_id);
     void UpdateReadWatchPages(VAddr start, VAddr end, bool track);
 
+    /// Armed read watches per page. The page manager supports only one read
+    /// watcher per page, so only 0<->1 transitions are forwarded to it.
+    tsl::robin_map<u64, u32> readwatch_page_refs;
+
     void MarkAsMaybeDirty(ImageId image_id, Image& image);
 
     /// Removes the image and any views/surface metas that reference it.
