@@ -588,25 +588,50 @@ bool TextureCache::IsCpuReadbackCandidate(const Image& image) const {
 }
 
 void TextureCache::UpdateReadWatchPages(VAddr start, VAddr end, bool track) {
-    // The watcher API operates on one tracker region at a time.
+    // Adjacent small images routinely share their boundary pages, but the page
+    // manager supports a single read watcher per page (PageState packs the read
+    // watcher count into one bit, so a second arm silently wraps it to zero).
+    // Reference-count armed pages here and forward only 0<->1 transitions, one
+    // tracker region at a time.
     VAddr addr = start;
     while (addr < end) {
         const VAddr region_base = addr & ~TRACKER_HIGHER_PAGE_MASK;
         const VAddr region_end = std::min<VAddr>(end, region_base + TRACKER_HIGHER_PAGE_SIZE);
-        const size_t first_page = (addr - region_base) >> TRACKER_PAGE_BITS;
-        const size_t end_page = Common::DivCeil(region_end - region_base, TRACKER_BYTES_PER_PAGE);
         RegionBits mask;
         mask.Clear();
-        mask.SetRange(first_page, end_page);
-        // Pair the read watch with a write watch: read-blocked but writable pages are
-        // not representable by the host protection API, and a CPU write to a GPU-written
-        // image must fault into invalidation anyway.
-        if (track) {
-            tracker.UpdatePageWatchersForRegion<true, true>(region_base, mask);
-            tracker.UpdatePageWatchersForRegion<true, false>(region_base, mask);
-        } else {
-            tracker.UpdatePageWatchersForRegion<false, true>(region_base, mask);
-            tracker.UpdatePageWatchersForRegion<false, false>(region_base, mask);
+        bool any_transition = false;
+        for (VAddr page_addr = addr; page_addr < region_end;
+             page_addr += TRACKER_BYTES_PER_PAGE) {
+            const u64 page = page_addr >> TRACKER_PAGE_BITS;
+            bool transition = false;
+            if (track) {
+                transition = ++readwatch_page_refs[page] == 1;
+            } else {
+                auto it = readwatch_page_refs.find(page);
+                if (it == readwatch_page_refs.end() || it->second == 0) {
+                    LOG_ERROR(Render_Vulkan, "Read-watch refcount underflow page={:#x}",
+                              page_addr);
+                } else if (--it.value() == 0) {
+                    readwatch_page_refs.erase(it);
+                    transition = true;
+                }
+            }
+            if (transition) {
+                mask.Set((page_addr - region_base) >> TRACKER_PAGE_BITS);
+                any_transition = true;
+            }
+        }
+        if (any_transition) {
+            // Pair the read watch with a write watch: read-blocked but writable pages are
+            // not representable by the host protection API, and a CPU write to a GPU-written
+            // image must fault into invalidation anyway.
+            if (track) {
+                tracker.UpdatePageWatchersForRegion<true, true>(region_base, mask);
+                tracker.UpdatePageWatchersForRegion<true, false>(region_base, mask);
+            } else {
+                tracker.UpdatePageWatchersForRegion<false, true>(region_base, mask);
+                tracker.UpdatePageWatchersForRegion<false, false>(region_base, mask);
+            }
         }
         addr = region_end;
     }
