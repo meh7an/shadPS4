@@ -60,6 +60,8 @@ struct PageManager::Impl {
             return ReadPerm() | WritePerm();
         }
 
+        static constexpr u8 MaxWriteWatchers = (1u << 7) - 1;
+
         template <s32 delta, bool is_read>
         u8 AddDelta() {
             if constexpr (is_read) {
@@ -73,9 +75,21 @@ struct PageManager::Impl {
                 }
             } else {
                 if constexpr (delta == 1) {
+                    // Games that repeatedly resize a render target at a fixed address
+                    // accumulate many simultaneously tracked images over the same pages,
+                    // which can exceed what this counter can represent. Saturate rather
+                    // than wrap: an over-saturated page stays protected for longer than
+                    // needed, whereas wrapping to zero unprotects it immediately and makes
+                    // the matching untrack decrement from zero.
+                    if (num_write_watchers == MaxWriteWatchers) {
+                        return num_write_watchers;
+                    }
                     return ++num_write_watchers;
                 } else if (delta == -1) {
-                    ASSERT_MSG(num_write_watchers > 0, "Not enough watchers");
+                    if (num_write_watchers == 0) {
+                        // Only reachable once a page has saturated above.
+                        return 0;
+                    }
                     return --num_write_watchers;
                 } else {
                     return num_write_watchers;
